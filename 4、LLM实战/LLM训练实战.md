@@ -2,6 +2,9 @@
 在实际的开发中，手动实现LLM的Pretrain、SFT全流程是非常繁琐且浪费时间的，同时也无法保证和原文的效果能保持一致。因此，在实际开发中，我们多采用训练框架进行开发，接下来将介绍使用hugging face的Transformers框架，结合deepspeed、高效微调框架preft，进行模型的pretrain、SFT全流程。
 
 # 模型训练
+> 详见代码./code/main.py
+
+
 使用Hugging Face的Transformer框架完成LLM的训练过程。
 
 ## 初始化LLM
@@ -102,6 +105,15 @@ trainer.train()
 ```
 
 # Deepspeed初体验
+> 详见：
+>
+> ./code/main_deepspeed_version.py
+>
+> ./code/main_deepspeed_bash.sh
+>
+
+
+
 安装deepspeed框架，然后使用deepspeed指令进行运行即可。以下是bash文件示例：
 
 ```python
