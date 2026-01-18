@@ -137,6 +137,239 @@ deepspeed pretrain.py \
 
 ```
 
+
+
+## DeepSpeed框架详解
+DeepSpeed主要通过一个JSON配置文件传入参数。如下：
+
+```json
+{
+    "fp16": {
+        "enabled": "auto",
+        "loss_scale": 0,
+        "loss_scale_window": 1000,
+        "initial_scale_power": 16,
+        "hysteresis": 2,
+        "min_loss_scale": 1
+    },
+    "bf16": {
+        "enabled": "auto"
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": "auto",
+            "betas": "auto",
+            "eps": "auto",
+            "weight_decay": "auto"
+        }
+    },
+
+    "scheduler": {
+        "type": "WarmupLR",
+        "params": {
+            "warmup_min_lr": "auto",
+            "warmup_max_lr": "auto",
+            "warmup_num_steps": "auto"
+        }
+    },
+
+    "zero_optimization": {
+        "stage": 2,
+        "offload_optimizer": {
+            "device": "none",
+            "pin_memory": true
+        },
+        "allgather_partitions": true,
+        "allgather_bucket_size": 2e8,
+        "overlap_comm": true,
+        "reduce_scatter": true,
+        "reduce_bucket_size": 2e8,
+        "contiguous_gradients": true
+    },
+
+    "gradient_accumulation_steps": "auto",
+    "gradient_clipping": "auto",
+    "steps_per_print": 100,
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": "auto",
+    "wall_clock_breakdown": false
+}
+```
+
+### ZoRO配置（最重要）对应zero_optimization下key
+#### stage
+DeepSpeed拥有4个stage的选择（0/1/2/3）。
+
+| stage | 分片内容 | 适用场景 |
+| --- | --- | --- |
+| 0 | 无分片（等同于普通训练） | 小模型 |
+| 1 | 分片 optimizer states | 中等模型 |
+| 2 | 分片 optimizer + gradients | 大模型 |
+| 3 | 分片 optimizer + gradients + parameters（并支持 partitioned model） | 超大模型 |
+
+
+#### stage3_param_persistence_threshold
+该参数针对stage3，控制参数是否持久化到GPU内存中。
+
+作用：减少参数在GPU之间移动，降低通信开销。
+
+#### contiguous_gradients
+梯度是否连续存储。
+
+作用：减少fragmentation，提高空间利用率。
+
+#### reduce_bucket_size
+梯度 reduce 的 bucket 大小。
+
+作用：影响通信与显存峰值
+
+#### overlap_comm
+是否 overlap 通信与计算
+
+作用：提高训练吞吐，但对网络/带宽敏感
+
+#### allgather_bucket_size
+allgather 的 bucket 大小
+
+作用：影响通信效率与显存峰值
+
+### 训练/优化器相关
+#### train_batch_size
+就是batch_size大小。
+
+计算：train_batch_size = 每张卡训练的batch_size * gradient_accumulation_steps * world_size
+
+#### gradient_accumulation_steps
+梯度累计步数
+
+作用：多次累加得到最终的batch
+
+#### optimizer
+优化器
+
+### 精度
+#### `fp16` 或 `bf16`
+半精度训练，两者之间的差别在于使用同样的bit数，表达的小数范围不同。
+
+### activation_checkpointing
+开启activation checkpoint
+
+作用：减少activation显存，但是会增加计算
+
+### gradient_clipping
+梯度裁剪
+
+作用：稳定训练
+
+### steps_per_print
+日志打印间隔
+
+## 显存计算
+我们用参数量 `P` 表示模型参数数（单位：bytes），用 GPU 数量 `N` 表示并行 GPU 数。
+
+> 这里忽略 activation，因为 activation 与 batch/seq_len/hidden 相关，通常是显存最大头。
+>
+
+### Stage 0
+普通训练（不做任何优化）
+
+| 内容 | 大小 |
+| --- | --- |
+| model parameters | P |
+| gradients | P |
+| optimizer states | 2P（AdamW） |
+| activation | A |
+
+
+**总显存**：
+
+```plain
+mem_stage0 = P + P + 2P + A = 4P + A
+```
+
+### Stage 1
+将opitmizer state进行分片，即将优化器参数分片，分别存储到N张卡上。
+
+```plain
+optimizer_per_gpu = 2P / N
+```
+
+**每卡显存**:
+
+```plain
+mem_stage1 = P + P + (2P/N) + A
+         = 2P + 2P/N + A
+```
+
+### stage 2
+分片：optimizer + gradient。分别存储到N张卡上。
+
+```plain
+grad_per_gpu = P / N
+optimizer_per_gpu = 2P / N
+```
+
+**每卡显存**:
+
+```plain
+mem_stage2 = P + (P/N) + (2P/N) + A
+         = P + 3P/N + A
+```
+
+### stage 3
+分片：optimizer + gradient + model parameters。分别存储到N张卡上
+
+```plain
+grad_per_gpu = P / N
+optimizer_per_gpu = 2P / N
+param_per_gpu = P / N
+```
+
+**每卡显存**:
+
+```plain
+mem_stage3 = (P/N) + (P/N) + (2P/N) + A
+         = 4P/N + A
+```
+
+## Activation Checkpointa
+Activation：forward计算的中间激活值。主要用于反向传播时进行计算。
+
+因为在反向传播的时候必须用到：
+
++ 每一层的输入
++ 每一层的输出（activation）
+
+因此，默认情况下，pytorch会吧所有的activation保存到显存，直到backward计算完成。
+
+显存只与每张卡上的batch_size、seq_len、hidden_dim、模型结构有关。
+
+**每卡显存：**
+
+```plain
+activation ≈ batch_size * seq_len * hidden_dim * bytes_per_token * factor
+```
+
+其中：
+
++ hidden_dim 是模型隐藏维度（Qwen 3 0.8B 约 4096）
++ bytes_per_token：bf16/ fp16 = 2 bytes
++ factor：网络结构相关（约 1.5 ~ 2）
+
+当 seq_len 2048、batch 16 时，activation 会非常巨大。
+
+### 开启activation checkpoint原理
+Activation checkpointing 的做法是：
+
++ **不保存所有 activation**
++ 只保存少量 checkpoint（例如每 N 层）
++ backward 时需要时再重新计算 forward（recompute）
+
+因此，显存开销会变小，但是计算量会变大。
+
+
+
 # 有监督微调（SFT）
 SFT和Pretrain的区别主要是数据集的问题，SFT目标是让模型具有指令遵循的能力，即问什么，答什么的能力，防止她答非所问。
 
